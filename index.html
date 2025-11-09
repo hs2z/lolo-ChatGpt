@@ -580,8 +580,8 @@
             chatMessages.scrollTop = chatMessages.scrollHeight;
         }
         
-        // Send message to OpenRouter
-        async function sendMessageToOpenRouter(message) {
+        // Send message to OpenRouter with retry mechanism
+        async function sendMessageToOpenRouter(message, retryCount = 0) {
             // Add user message
             conversation.push({ role: 'user', content: message });
             addMessage(message, 'user');
@@ -594,39 +594,123 @@
             }
             
             // Show loading
+            const loadingIndex = chatMessages.children.length;
             addMessage('جاري الكتابة...', 'bot');
             
             try {
+                // Get current origin for referer
+                const currentOrigin = window.location.origin || window.location.href;
+                
+                // Validate API key
+                if (!OPENROUTER_API_KEY || OPENROUTER_API_KEY.trim() === '') {
+                    throw new Error('مفتاح API غير موجود');
+                }
+                
+                // Create AbortController for timeout
+                const controller = new AbortController();
+                const timeoutId = setTimeout(() => controller.abort(), 30000); // 30 seconds timeout
+                
                 const response = await fetch('https://openrouter.ai/api/v1/chat/completions', {
                     method: 'POST',
                     headers: {
                         'Authorization': `Bearer ${OPENROUTER_API_KEY}`,
                         'Content-Type': 'application/json',
-                        'HTTP-Referer': window.location.origin,
+                        'HTTP-Referer': currentOrigin,
                         'X-Title': 'LoLo ChatBot'
                     },
                     body: JSON.stringify({
                         model: 'openai/gpt-3.5-turbo',
                         messages: conversation,
-                        max_tokens: 512
-                    })
+                        max_tokens: 512,
+                        temperature: 0.7
+                    }),
+                    mode: 'cors',
+                    credentials: 'omit',
+                    signal: controller.signal
                 });
                 
-                if (!response.ok) throw new Error('خطأ في الاتصال بالخادم');
+                clearTimeout(timeoutId);
+                
+                // Check response status
+                if (!response.ok) {
+                    const errorText = await response.text();
+                    let errorMsg = 'خطأ في الاتصال بالخادم';
+                    
+                    try {
+                        const errorData = JSON.parse(errorText);
+                        errorMsg = errorData.error?.message || errorData.message || errorMsg;
+                    } catch (e) {
+                        errorMsg = `خطأ ${response.status}: ${response.statusText}`;
+                    }
+                    
+                    // Retry on server errors (5xx) or rate limit (429)
+                    if ((response.status >= 500 || response.status === 429) && retryCount < 2) {
+                        // Remove loading message
+                        if (chatMessages.children[loadingIndex]) {
+                            chatMessages.removeChild(chatMessages.children[loadingIndex]);
+                        }
+                        addMessage('إعادة المحاولة...', 'bot');
+                        await new Promise(resolve => setTimeout(resolve, 2000));
+                        return sendMessageToOpenRouter(message, retryCount + 1);
+                    }
+                    
+                    throw new Error(errorMsg);
+                }
                 
                 const data = await response.json();
-                const botMsg = data.choices?.[0]?.message?.content?.trim() || 'لم أتمكن من الرد.';
+                
+                if (!data.choices || !data.choices[0] || !data.choices[0].message) {
+                    throw new Error('استجابة غير صحيحة من الخادم');
+                }
+                
+                const botMsg = data.choices[0].message.content?.trim() || 'لم أتمكن من الرد.';
                 
                 conversation.push({ role: 'assistant', content: botMsg });
                 
                 // Remove loading message
-                chatMessages.removeChild(chatMessages.lastChild);
+                if (chatMessages.children[loadingIndex]) {
+                    chatMessages.removeChild(chatMessages.children[loadingIndex]);
+                }
                 addMessage(botMsg, 'bot');
                 
             } catch (err) {
                 // Remove loading message
-                chatMessages.removeChild(chatMessages.lastChild);
-                addMessage('خطأ: ' + err.message, 'bot');
+                if (chatMessages.children[loadingIndex]) {
+                    chatMessages.removeChild(chatMessages.children[loadingIndex]);
+                }
+                
+                // Better error messages
+                let errorMsg = 'خطأ في الاتصال بالخادم';
+                
+                if (err.name === 'AbortError') {
+                    errorMsg = 'انتهت مهلة الاتصال. يرجى المحاولة مرة أخرى.';
+                } else if (err.name === 'TypeError' && err.message.includes('fetch')) {
+                    errorMsg = 'خطأ في الاتصال بالإنترنت. تحقق من اتصالك.';
+                } else if (err.name === 'TypeError' && err.message.includes('Failed to fetch')) {
+                    errorMsg = 'فشل الاتصال بالخادم. قد تكون هناك مشكلة في CORS أو الاتصال.';
+                } else if (err.message) {
+                    errorMsg = err.message;
+                }
+                
+                // Retry on network errors or timeout
+                if ((err.name === 'TypeError' || err.name === 'AbortError') && retryCount < 2) {
+                    addMessage('إعادة المحاولة...', 'bot');
+                    await new Promise(resolve => setTimeout(resolve, 2000));
+                    return sendMessageToOpenRouter(message, retryCount + 1);
+                }
+                
+                addMessage('خطأ: ' + errorMsg, 'bot');
+                console.error('Chat error:', err);
+                
+                // Log detailed error for debugging
+                if (window.location.hostname === 'localhost' || window.location.hostname === '127.0.0.1') {
+                    console.error('Error details:', {
+                        name: err.name,
+                        message: err.message,
+                        stack: err.stack,
+                        retryCount: retryCount
+                    });
+                }
             }
         }
         
